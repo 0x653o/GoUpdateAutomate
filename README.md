@@ -70,6 +70,7 @@ Usage: update_go.sh [command] [options]
   list                Show locally installed versions
   list-remote [n]     Show latest N releases from go.dev (default: 10)
   current             Show the active version
+  purge               Remove EVERYTHING this script ever installed
 ```
 
 ### Examples
@@ -98,7 +99,22 @@ sudo ./update_go.sh update
 
 # Remove a version
 sudo ./update_go.sh remove 1.21.0
+
+# Full uninstall — removes everything this script ever created
+sudo ./update_go.sh purge
 ```
+
+### Purge — what gets removed
+
+```
+/usr/local/go-versions/    ← all installed Go versions
+/usr/local/go              ← active symlink
+/etc/profile.d/go.sh       ← system-wide PATH entry
+~/.bashrc                  ← marker block stripped with sed
+/root/.bashrc              ← marker block stripped with sed
+```
+
+> Your Go source code, `$GOPATH` workspace, and this script are **not** touched.
 
 ---
 

@@ -504,6 +504,120 @@ cmd_update() {
     ORIGINAL_CMD="update" cmd_install ""
 }
 
+# ── cmd: purge ────────────────────────────────────────────────────────────────
+# Removes EVERYTHING this script ever created:
+#   • All versioned Go directories under $VERSIONS_DIR
+#   • The $ACTIVE_LINK symlink
+#   • /etc/profile.d/go.sh
+#   • The marker block (>>> go managed by update_go.sh <<<) from every RC file
+# Does NOT touch Go code the user wrote, GOPATH workspace, or this script.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_purge() {
+    local real_usr
+    real_usr=$(real_user)
+    local user_profile root_profile sysd="/etc/profile.d/go.sh"
+    user_profile=$(profile_for_user "$real_usr")
+    root_profile=$(profile_for_user "root")
+
+    header "Purge preview — the following will be removed:"
+    echo "" >&2
+
+    # Collect what actually exists so the preview is accurate
+    local items=()
+
+    [[ -d "$VERSIONS_DIR" ]] && items+=("  ${RED}dir${RESET}   ${VERSIONS_DIR}/")
+    [[ -L "$ACTIVE_LINK" || -e "$ACTIVE_LINK" ]] && \
+        items+=("  ${RED}link${RESET}  ${ACTIVE_LINK}  →  $(readlink "$ACTIVE_LINK" 2>/dev/null || echo '?')")
+    [[ -f "$sysd" ]] && items+=("  ${RED}file${RESET}  ${sysd}")
+
+    # RC files — only list them if they contain our marker
+    local rc_files=()
+    for f in "$user_profile" "$root_profile"; do
+        [[ "$f" == "$user_profile" || "$EUID" -eq 0 ]] || continue
+        grep -qF "$MARKER_BEGIN" "$f" 2>/dev/null && rc_files+=("$f")
+    done
+    for f in "${rc_files[@]}"; do
+        items+=("  ${YELLOW}rc${RESET}    ${f}  (marker block removed)")
+    done
+
+    if [[ ${#items[@]} -eq 0 ]]; then
+        success "Nothing from this script found — already clean."
+        return 0
+    fi
+
+    for item in "${items[@]}"; do echo -e "$item" >&2; done
+    echo "" >&2
+    warn "This cannot be undone. Go programs in your GOPATH are NOT affected."
+    echo "" >&2
+    read -rp "Type 'yes' to confirm purge: " confirm
+    [[ "$confirm" != "yes" ]] && { info "Aborted."; return 0; }
+    echo "" >&2
+
+    # ── 1. Remove all installed versions ──────────────────────────────────────
+    if [[ -d "$VERSIONS_DIR" ]]; then
+        info "Removing ${VERSIONS_DIR} …"
+        safe_sudo rm -rf "$VERSIONS_DIR"
+        success "Removed ${VERSIONS_DIR}"
+    fi
+
+    # ── 2. Remove active symlink ───────────────────────────────────────────────
+    if [[ -L "$ACTIVE_LINK" || -e "$ACTIVE_LINK" ]]; then
+        info "Removing symlink ${ACTIVE_LINK} …"
+        safe_sudo rm -rf "$ACTIVE_LINK"
+        success "Removed ${ACTIVE_LINK}"
+    fi
+
+    # ── 3. Remove /etc/profile.d/go.sh ────────────────────────────────────────
+    if [[ -f "$sysd" ]]; then
+        info "Removing ${sysd} …"
+        safe_sudo rm -f "$sysd"
+        success "Removed ${sysd}"
+    fi
+
+    # ── 4. Strip marker block from RC files using sed ─────────────────────────
+    _strip_marker() {
+        local f="$1" owner="$2"
+        [[ -f "$f" ]] || return 0
+        grep -qF "$MARKER_BEGIN" "$f" 2>/dev/null || return 0
+        info "Cleaning marker block from ${f} …"
+
+        # sed: delete from MARKER_BEGIN through MARKER_END inclusive,
+        #      plus the blank line that precedes the block (if present).
+        local script
+        script=$(cat <<'SED'
+/^[[:space:]]*$/{
+  N
+  /\n# >>> go managed by update_go\.sh >>>/{ N; :loop; /# <<< go managed by update_go\.sh <<<$/!{ N; b loop }; d }
+  P; D
+}
+/# >>> go managed by update_go\.sh >>>/,/# <<< go managed by update_go\.sh <<</d
+SED
+)
+        if [[ "$EUID" -eq 0 && "$owner" != "root" ]]; then
+            sudo -u "$owner" sed -i "$script" "$f"
+        else
+            sed -i "$script" "$f"
+        fi
+        success "Cleaned  ${f}"
+    }
+
+    _strip_marker "$user_profile" "$real_usr"
+    [[ "$EUID" -eq 0 ]] && _strip_marker "$root_profile" "root"
+
+    # ── 5. Remove PATH from current session ───────────────────────────────────
+    local go_bin="${ACTIVE_LINK}/bin"
+    export PATH=$(echo "$PATH" | tr ':' '\n' \
+        | grep -v "^${go_bin}$" \
+        | grep -v "^${VERSIONS_DIR}" \
+        | paste -sd ':' -)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    echo "" >&2
+    success "Purge complete. Go has been fully removed."
+    echo -e "  ${CYAN}Restart your terminal${RESET} (or run 'hash -r') to clear the shell cache." >&2
+    echo "" >&2
+}
+
 # =============================================================================
 #  Entry point
 # =============================================================================
@@ -523,6 +637,7 @@ Commands:
   ${CYAN}list${RESET}                Show locally installed versions
   ${CYAN}list-remote [n]${RESET}     Show latest N releases from go.dev  (default: 10)
   ${CYAN}current${RESET}             Show the active version
+  ${RED}purge${RESET}               Remove ALL Go versions, symlink, profile entries
 
 Environment:
   GO_VERSIONS_DIR   Where versions are stored  (default: /usr/local/go-versions)
@@ -535,6 +650,7 @@ Examples:
   $(basename "$0") use 1.22.5
   $(basename "$0") list-remote 5
   $(basename "$0") remove 1.21.0
+  $(basename "$0") purge              # full uninstall
 
 EOF
 }
@@ -555,6 +671,7 @@ main() {
         list|ls)      cmd_list ;;
         list-remote)  cmd_list_remote "$@" ;;
         current)      cmd_current ;;
+        purge)        cmd_purge ;;
         -h|--help|help) usage ;;
         *) warn "Unknown command: ${cmd}"; usage; exit 1 ;;
     esac
