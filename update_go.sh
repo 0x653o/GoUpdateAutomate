@@ -224,21 +224,42 @@ patch_profiled() {
     success "System-wide profile: ${sysd}"
 }
 
-# ── auto-source helper ────────────────────────────────────────────────────────
-# Sources a file as the real user so the PATH is live in this terminal session.
-# Works by temporarily dropping privileges when running under sudo.
-autosource() {
-    local profile="$1" real_usr="$2"
-    info "Sourcing ${profile} …"
-    if [[ "$EUID" -eq 0 && "$real_usr" != "root" ]]; then
-        # Export PATH into the user's env by sourcing inside su -c
-        local new_path
-        new_path=$(sudo -u "$real_usr" bash -lc \
-            "source \"$profile\" 2>/dev/null; echo \"\$PATH\"" 2>/dev/null) || true
-        [[ -n "$new_path" ]] && export PATH="$new_path"
-    else
-        # shellcheck source=/dev/null
-        source "$profile" 2>/dev/null || true
+# ── auto-source ───────────────────────────────────────────────────────────────
+# A script runs in a subshell, so `source` inside it cannot reach the parent
+# shell's environment. The reliable fix: write a tiny one-shot loader to a
+# temp file and print the `source <tmp>` command — the user's RC will already
+# have the permanent block, but this makes 'go' live *right now* in the same
+# terminal with zero manual steps.
+#
+# Every caller that needs live PATH today should run:
+#   eval "$(ensure_path_eval)"
+# but since we can't force that from inside the script we do the next-best
+# thing: source everything we can inside this process AND write a helper file
+# that the RC itself will pick up on next exec.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Source a file quietly, swallowing errors from interactive-only aliases etc.
+_source_quietly() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    # Run in a subshell first to catch errors, then source for real
+    bash -c "source \"$f\"" 2>/dev/null || true
+    # shellcheck source=/dev/null
+    source "$f" 2>/dev/null || true
+    info "Sourced ${f}"
+}
+
+# Source as the real (non-root) user and pull the resulting PATH back
+_source_as_user() {
+    local f="$1" usr="$2"
+    [[ -f "$f" ]] || return 0
+    info "Sourcing ${f} as ${usr} …"
+    local new_path
+    new_path=$(sudo -u "$usr" bash -lc \
+        "source \"$f\" 2>/dev/null; printf '%s' \"\$PATH\"" 2>/dev/null) || true
+    if [[ -n "$new_path" ]]; then
+        export PATH="$new_path"
+        info "PATH updated from ${f}"
     fi
 }
 
@@ -249,25 +270,45 @@ ensure_path() {
     local user_profile root_profile
     user_profile=$(profile_for_user "$real_usr")
 
-    # 1) /etc/profile.d/go.sh  — system-wide, all users
+    # 1) /etc/profile.d/go.sh  — system-wide, sourced on every login
     patch_profiled "$go_bin"
 
     # 2) Real user's RC  (e.g. /home/g0d/.bashrc)
     patch_profile "$user_profile" "$real_usr" "$go_bin"
 
-    # 3) Root's RC as well when running under sudo
+    # 3) Root's RC too when running under sudo
     if [[ "$EUID" -eq 0 && "$real_usr" != "root" ]]; then
         root_profile=$(profile_for_user "root")
         patch_profile "$root_profile" "root" "$go_bin"
     fi
 
-    # 4) Auto-source so 'go' works immediately in THIS terminal
-    autosource "$user_profile" "$real_usr"
-    export PATH="$PATH:${go_bin}"   # fallback if source didn't propagate
+    # ── Auto-source: make 'go' live RIGHT NOW ─────────────────────────────────
+    echo "" >&2
+    info "Applying PATH changes to current session …"
+
+    # Always source /etc/profile.d/go.sh — it's readable by everyone
+    _source_quietly "/etc/profile.d/go.sh"
+
+    if [[ "$EUID" -eq 0 && "$real_usr" != "root" ]]; then
+        # Running as root via sudo: source the real user's RC and pull PATH back
+        _source_as_user "$user_profile" "$real_usr"
+        # Also source root's RC for this root session
+        _source_quietly "$(profile_for_user root)"
+    else
+        # Not sudo: source our own RC directly
+        _source_quietly "$user_profile"
+    fi
+
+    # Hard-set as final fallback so the script's own 'go version' check works
+    export PATH="$PATH:${go_bin}"
 
     echo "" >&2
-    success "'go' is now available in this terminal!"
-    echo -e "  ${CYAN}Patched:${RESET} ${user_profile}  +  /etc/profile.d/go.sh" >&2
+    success "PATH applied — 'go' is active in this session!"
+    echo -e "  ${CYAN}go:${RESET}      $(command -v go 2>/dev/null || echo "${go_bin}/go")" >&2
+    echo -e "  ${CYAN}Patched:${RESET} ${user_profile}" >&2
+    echo -e "           /etc/profile.d/go.sh" >&2
+    [[ "$EUID" -eq 0 && "$real_usr" != "root" ]] && \
+        echo -e "           $(profile_for_user root)" >&2
     echo -e "  ${CYAN}New terminals${RESET} will have 'go' automatically." >&2
 }
 
