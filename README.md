@@ -1,18 +1,19 @@
 # GoUpdateAutomate
 
-A zero-dependency Bash script that automatically detects, downloads, verifies, and installs the latest stable version of [Go](https://go.dev/) — on Linux and macOS.
+A zero-dependency Bash script that manages multiple Go versions — install, switch, remove, and auto-update with SHA-256 verification.
 
 ---
 
 ## Features
 
-- 🔍 **Queries go.dev** for the latest stable release at runtime
+- 🔍 **Queries go.dev** for latest stable releases at runtime
+- 🗂️ **Multi-version management** — install several versions side-by-side
+- 🔀 **Instant version switching** via symlink
 - ⚖️ **Semantic version comparison** — skips install if already up to date
 - 🔒 **SHA-256 checksum verification** before extracting
 - 🖥️ **Auto-detects OS & architecture** (`linux`/`darwin`, `amd64`/`arm64`/`armv6l`/`386`)
-- 🛠️ **Patches your shell profile** (`.bashrc`, `.zshrc`, etc.) with the correct `$PATH` entry
+- 🛠️ **Patches your shell profile** with the correct `$PATH` entry
 - 🎨 **Coloured output** with clear `INFO` / `OK` / `WARN` / `ERROR` levels
-- ✅ **Non-interactive mode** for CI/CD pipelines (`--yes` flag)
 
 ---
 
@@ -24,45 +25,67 @@ A zero-dependency Bash script that automatically detects, downloads, verifies, a
 | `curl` **or** `wget` | Download + API calls |
 | `sha256sum` | Checksum verification |
 | `tar` | Extraction |
-| `sudo` | Write access to install dir (default `/usr/local`) |
+| `sudo` | Write access to install dir |
 
 ---
 
 ## Quick Start
 
 ```bash
-# Clone
-git clone https://github.com/0x653o/GoUpdateAutomate.git
+git clone git@github.com:0x653o/GoUpdateAutomate.git
 cd GoUpdateAutomate
-
-# Make executable
 chmod +x update_go.sh
 
-# Run (interactive — prompts before installing)
-sudo ./update_go.sh
+# Install latest stable Go
+sudo ./update_go.sh install
 
-# Reload PATH and verify
+# Reload PATH
 source ~/.bashrc
 go version
 ```
 
 ---
 
-## Usage
+## Commands
+
+```
+Usage: update_go.sh [command] [options]
+
+  install [version]   Install a specific version (default: latest stable)
+  update              Install latest stable & activate it
+  use <version>       Switch the active Go version
+  remove <version>    Uninstall a specific version
+  list                Show locally installed versions
+  list-remote [n]     Show latest N releases from go.dev (default: 10)
+  current             Show the active version
+```
+
+### Examples
 
 ```bash
-# Interactive (prompts before installing)
-sudo ./update_go.sh
+# Install latest stable
+sudo ./update_go.sh install
 
-# Non-interactive / CI-friendly
-sudo ./update_go.sh --yes
-sudo ./update_go.sh -y
+# Install a specific version
+sudo ./update_go.sh install 1.22.5
 
-# Custom install directory (default: /usr/local)
-sudo GO_INSTALL_DIR=/opt ./update_go.sh --yes
+# See what's available remotely
+./update_go.sh list-remote 5
 
-# Override shell profile to patch
-PROFILE_FILE=~/.zshrc sudo ./update_go.sh --yes
+# Switch active version
+sudo ./update_go.sh use 1.22.5
+
+# Show installed versions
+./update_go.sh list
+
+# Show active version
+./update_go.sh current
+
+# Update to latest
+sudo ./update_go.sh update
+
+# Remove a version
+sudo ./update_go.sh remove 1.21.0
 ```
 
 ---
@@ -70,16 +93,15 @@ PROFILE_FILE=~/.zshrc sudo ./update_go.sh --yes
 ## How It Works
 
 ```
-1. Detect OS + CPU architecture
-2. Query https://go.dev/dl/?mode=json for the latest stable version
-3. Compare against the currently installed version (via `go version`)
-4. If an upgrade is available:
-   a. Download the tarball from https://dl.google.com/go
-   b. Verify SHA-256 checksum against go.dev's published hash
-   c. Remove the old /usr/local/go directory
-   d. Extract the new tarball to /usr/local
-   e. Ensure /usr/local/go/bin is in your PATH
+Versions directory:  /usr/local/go-versions/
+  ├── go1.22.5/
+  ├── go1.25.0/
+  └── go1.26.3/
+
+Active symlink:      /usr/local/go → /usr/local/go-versions/go1.26.3
 ```
+
+Each version is installed in its own directory. `use` just re-points the symlink — switching is instant with no re-download.
 
 ---
 
@@ -87,7 +109,8 @@ PROFILE_FILE=~/.zshrc sudo ./update_go.sh --yes
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GO_INSTALL_DIR` | `/usr/local` | Where Go is installed (`$GO_INSTALL_DIR/go`) |
+| `GO_VERSIONS_DIR` | `/usr/local/go-versions` | Directory holding all installed versions |
+| `GO_ACTIVE_LINK` | `/usr/local/go` | Symlink pointing to the active version |
 | `PROFILE_FILE` | auto-detected | Shell profile to patch for `PATH` |
 
 ---
@@ -96,25 +119,20 @@ PROFILE_FILE=~/.zshrc sudo ./update_go.sh --yes
 
 ```
 ══════════════════════════════════════
-   Go Version Manager — update_go.sh
+   GoUpdateAutomate — Go Version Mgr
 ══════════════════════════════════════
 
 [INFO]  Platform: linux-amd64
-[INFO]  Fetching latest Go version from go.dev …
-[INFO]  Latest available: go1.26.3
-[INFO]  Currently installed: go1.25.0
-[INFO]  Upgrade available: go1.25.0 → go1.26.3
-
-Proceed with installation of go1.26.3? [Y/n] y
-
+[INFO]  Target version: go1.26.3
 [INFO]  Downloading https://dl.google.com/go/go1.26.3.linux-amd64.tar.gz …
-[INFO]  Verifying checksum …
-[OK]    Checksum verified ✓
-[INFO]  Removing old Go from /usr/local/go …
-[INFO]  Extracting to /usr/local …
-[OK]    Extraction complete.
-[OK]    Go go1.26.3 installed successfully!
-        go version: go version go1.26.3 linux/amd64
+################################################# 100.0%
+[INFO]  Verifying SHA-256 checksum …
+[OK]    Checksum OK ✓
+[INFO]  Installing go1.26.3 to /usr/local/go-versions/go1.26.3 …
+[OK]    go1.26.3 installed → /usr/local/go-versions/go1.26.3
+[INFO]  Switching active version to go1.26.3 …
+[OK]    Active Go → go1.26.3
+        go version go1.26.3 linux/amd64
 ```
 
 ---

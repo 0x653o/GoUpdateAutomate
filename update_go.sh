@@ -1,115 +1,138 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  update_go.sh — Auto-download & install the latest Go version
+#  update_go.sh — Go Version Manager
+#  Commands: install, use, list, list-remote, remove, current
 # =============================================================================
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GO_INSTALL_DIR="${GO_INSTALL_DIR:-/usr/local}"
-PROFILE_FILE="${PROFILE_FILE:-}"          # leave blank = auto-detect
+VERSIONS_DIR="${GO_VERSIONS_DIR:-/usr/local/go-versions}"  # all versions live here
+ACTIVE_LINK="${GO_ACTIVE_LINK:-/usr/local/go}"             # symlink → active version
+PROFILE_FILE="${PROFILE_FILE:-}"                            # blank = auto-detect
 GO_DL_BASE="https://dl.google.com/go"
 GO_API="https://go.dev/dl/?mode=json"
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Colours ───────────────────────────────────────────────────────────────────
+# ── Colours (all status output → stderr so stdout stays clean) ────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
-success() { echo -e "${GREEN}[OK]${RESET}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+info()    { echo -e "${CYAN}[INFO]${RESET}  $*" >&2; }
+success() { echo -e "${GREEN}[OK]${RESET}    $*" >&2; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*" >&2; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+header()  { echo -e "\n${BOLD}$*${RESET}" >&2; }
 
 # ── Detect OS / arch ──────────────────────────────────────────────────────────
 detect_platform() {
     local os arch
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
     case "$os" in
-        linux)  os="linux" ;;
+        linux)  os="linux"  ;;
         darwin) os="darwin" ;;
         *) error "Unsupported OS: $os" ;;
     esac
-
     arch=$(uname -m)
     case "$arch" in
-        x86_64)          arch="amd64" ;;
-        aarch64|arm64)   arch="arm64" ;;
-        armv6l)          arch="armv6l" ;;
-        i386|i686)       arch="386" ;;
+        x86_64)        arch="amd64"  ;;
+        aarch64|arm64) arch="arm64"  ;;
+        armv6l)        arch="armv6l" ;;
+        i386|i686)     arch="386"    ;;
         *) error "Unsupported architecture: $arch" ;;
     esac
-
     echo "${os}-${arch}"
 }
 
-# ── Fetch latest Go version string ────────────────────────────────────────────
-fetch_latest_version() {
-    local latest
+# ── HTTP helper ───────────────────────────────────────────────────────────────
+http_get() {
     if command -v curl &>/dev/null; then
-        latest=$(curl -fsSL "$GO_API" | grep -oP '"version":\s*"\Kgo[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        curl -fsSL "$1"
     elif command -v wget &>/dev/null; then
-        latest=$(wget -qO- "$GO_API" | grep -oP '"version":\s*"\Kgo[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        wget -qO- "$1"
     else
-        error "Neither curl nor wget found. Please install one of them."
+        error "Neither curl nor wget found."
     fi
-    [[ -z "$latest" ]] && error "Could not fetch latest Go version from go.dev"
-    echo "$latest"
 }
 
-# ── Get installed version (returns empty if not installed) ────────────────────
-current_version() {
-    if command -v go &>/dev/null; then
-        go version | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?'
-    elif [[ -x "${GO_INSTALL_DIR}/go/bin/go" ]]; then
-        "${GO_INSTALL_DIR}/go/bin/go" version | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?'
+http_download() {   # http_download <url> <dest>
+    if command -v curl &>/dev/null; then
+        curl -fL --progress-bar -o "$2" "$1"
+    else
+        wget -q --show-progress -O "$2" "$1"
+    fi
+}
+
+# ── API helpers ───────────────────────────────────────────────────────────────
+fetch_stable_versions() {
+    # Prints JSON array of stable releases; cached in /tmp for this session
+    local cache="/tmp/go_versions_cache.json"
+    if [[ ! -f "$cache" ]] || [[ $(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) )) -gt 300 ]]; then
+        http_get "${GO_API}&stable=true" > "$cache"
+    fi
+    cat "$cache"
+}
+
+fetch_latest_version() {
+    fetch_stable_versions | grep -oP '"version":\s*"\Kgo[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1
+}
+
+fetch_all_remote_versions() {
+    fetch_stable_versions | grep -oP '"version":\s*"\Kgo[0-9]+\.[0-9]+(\.[0-9]+)?'
+}
+
+fetch_sha256() {    # fetch_sha256 <filename>  → prints hash or empty
+    fetch_stable_versions \
+        | grep -A20 "\"$1\"" \
+        | grep -oP '"sha256":\s*"\K[0-9a-f]+' | head -1
+}
+
+# ── Version helpers ───────────────────────────────────────────────────────────
+normalise() { echo "${1#go}"; }   # "go1.22.1" → "1.22.1"
+
+# Returns 0 if $1 >= $2  (both bare "X.Y.Z")
+ver_ge() { [[ "$(printf '%s\n%s' "$1" "$2" | sort -V | head -1)" == "$2" ]]; }
+
+active_version() {
+    if [[ -x "${ACTIVE_LINK}/bin/go" ]]; then
+        "${ACTIVE_LINK}/bin/go" version | grep -oP 'go[0-9]+\.[0-9]+(\.[0-9]+)?'
     else
         echo ""
     fi
 }
 
-# ── Compare semver strings (strips leading "go") ──────────────────────────────
-# Returns 0 if $1 >= $2 (already up to date)
-is_up_to_date() {
-    local cur="${1#go}" lat="${2#go}"
-    # Use sort -V (version sort) — available in GNU coreutils
-    local older
-    older=$(printf '%s\n%s' "$cur" "$lat" | sort -V | head -1)
-    [[ "$older" == "$lat" ]]   # latest <= current  →  up to date
+installed_versions() {
+    # Lists go1.X.Y directory names under VERSIONS_DIR, sorted
+    if [[ -d "$VERSIONS_DIR" ]]; then
+        find "$VERSIONS_DIR" -maxdepth 1 -name 'go[0-9]*' -type d \
+            | xargs -r -I{} basename {} \
+            | sort -V
+    fi
 }
 
-# ── Auto-detect shell profile file ────────────────────────────────────────────
+# ── Shell profile ─────────────────────────────────────────────────────────────
 detect_profile() {
-    if [[ -n "$PROFILE_FILE" ]]; then echo "$PROFILE_FILE"; return; fi
-    local shell_name
-    shell_name=$(basename "${SHELL:-bash}")
-    case "$shell_name" in
-        bash)  echo "${HOME}/.bashrc" ;;
-        zsh)   echo "${HOME}/.zshrc" ;;
-        fish)  echo "${HOME}/.config/fish/config.fish" ;;
-        *)     echo "${HOME}/.profile" ;;
+    [[ -n "$PROFILE_FILE" ]] && { echo "$PROFILE_FILE"; return; }
+    case "$(basename "${SHELL:-bash}")" in
+        zsh)  echo "${HOME}/.zshrc"  ;;
+        fish) echo "${HOME}/.config/fish/config.fish" ;;
+        *)    echo "${HOME}/.bashrc" ;;
     esac
 }
 
-# ── Ensure PATH is set in profile ─────────────────────────────────────────────
 ensure_path() {
-    local profile go_bin="${GO_INSTALL_DIR}/go/bin"
+    local go_bin="${ACTIVE_LINK}/bin"
+    local profile
     profile=$(detect_profile)
-
     if ! grep -qF "$go_bin" "$profile" 2>/dev/null; then
-        info "Adding $go_bin to PATH in $profile"
-        {
-            echo ""
-            echo "# Go — added by update_go.sh"
-            echo "export PATH=\"\$PATH:${go_bin}\""
-        } >> "$profile"
-        success "PATH updated. Run:  source $profile"
+        info "Adding ${go_bin} to PATH in ${profile}"
+        { echo ""; echo "# Go — added by update_go.sh"; echo "export PATH=\"\$PATH:${go_bin}\""; } >> "$profile"
+        success "PATH updated — run: source ${profile}"
     fi
-
-    # Also export for this session
     export PATH="$PATH:${go_bin}"
 }
 
-# ── Download & verify tarball ─────────────────────────────────────────────────
+# ── Download & verify ─────────────────────────────────────────────────────────
+# Prints the tarball path on stdout; all messages go to stderr.
 download_go() {
     local version="$1" platform="$2"
     local tarball="${version}.${platform}.tar.gz"
@@ -117,104 +140,243 @@ download_go() {
     local dest="/tmp/${tarball}"
 
     if [[ -f "$dest" ]]; then
-        info "Tarball already in /tmp — skipping download."
+        info "Tarball already cached at ${dest}"
     else
         info "Downloading ${url} …"
-        if command -v curl &>/dev/null; then
-            curl -fL --progress-bar -o "$dest" "$url"
-        else
-            wget -q --show-progress -O "$dest" "$url"
-        fi
+        http_download "$url" "$dest"
     fi
 
-    # SHA256 checksum verification
-    info "Verifying checksum …"
-    local expected_sha
-    if command -v curl &>/dev/null; then
-        expected_sha=$(curl -fsSL "${GO_API}" \
-            | grep -A20 "\"${tarball}\"" \
-            | grep -oP '"sha256":\s*"\K[0-9a-f]+' | head -1)
-    else
-        expected_sha=$(wget -qO- "${GO_API}" \
-            | grep -A20 "\"${tarball}\"" \
-            | grep -oP '"sha256":\s*"\K[0-9a-f]+' | head -1)
-    fi
-
-    if [[ -n "$expected_sha" ]]; then
-        local actual_sha
-        actual_sha=$(sha256sum "$dest" | awk '{print $1}')
-        if [[ "$actual_sha" != "$expected_sha" ]]; then
+    info "Verifying SHA-256 checksum …"
+    local expected actual
+    expected=$(fetch_sha256 "$tarball")
+    if [[ -n "$expected" ]]; then
+        actual=$(sha256sum "$dest" | awk '{print $1}')
+        if [[ "$actual" != "$expected" ]]; then
             rm -f "$dest"
-            error "Checksum mismatch!\n  expected: $expected_sha\n  actual:   $actual_sha"
+            error "Checksum mismatch!\n  expected: $expected\n  actual:   $actual"
         fi
-        success "Checksum verified ✓"
+        success "Checksum OK ✓"
     else
-        warn "Could not fetch expected checksum — skipping verification."
+        warn "No checksum found — skipping verification."
     fi
 
-    echo "$dest"
+    echo "$dest"   # ← only this line goes to stdout
 }
 
-# ── Install ───────────────────────────────────────────────────────────────────
-install_go() {
-    local tarball="$1"
+# ── Sudo-aware install ────────────────────────────────────────────────────────
+safe_sudo() {
+    if [[ "$EUID" -eq 0 ]]; then "$@"; else sudo "$@"; fi
+}
 
-    # Remove old installation
-    if [[ -d "${GO_INSTALL_DIR}/go" ]]; then
-        info "Removing old Go from ${GO_INSTALL_DIR}/go …"
-        sudo rm -rf "${GO_INSTALL_DIR}/go"
+# =============================================================================
+#  COMMANDS
+# =============================================================================
+
+# ── cmd: current ──────────────────────────────────────────────────────────────
+cmd_current() {
+    local ver
+    ver=$(active_version)
+    if [[ -z "$ver" ]]; then
+        info "No active Go version."
+    else
+        echo -e "${BOLD}Active:${RESET} $ver  →  ${ACTIVE_LINK}"
+        "${ACTIVE_LINK}/bin/go" version
     fi
-
-    info "Extracting to ${GO_INSTALL_DIR} …"
-    sudo tar -C "$GO_INSTALL_DIR" -xzf "$tarball"
-
-    # Clean up
-    rm -f "$tarball"
-    success "Extraction complete."
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-main() {
-    echo -e "\n${BOLD}══════════════════════════════════════${RESET}"
-    echo -e "${BOLD}   Go Version Manager — update_go.sh  ${RESET}"
-    echo -e "${BOLD}══════════════════════════════════════${RESET}\n"
+# ── cmd: list ─────────────────────────────────────────────────────────────────
+cmd_list() {
+    header "Installed Go versions  (${VERSIONS_DIR})"
+    local active ver
+    active=$(active_version)
+    local found=0
+    while IFS= read -r ver; do
+        [[ -z "$ver" ]] && continue
+        found=1
+        local tag=""
+        [[ "go${ver#go}" == "$active" || "$ver" == "$active" ]] && tag="  ${GREEN}← active${RESET}"
+        echo -e "  ${ver}${tag}"
+    done < <(installed_versions)
+    [[ $found -eq 0 ]] && echo "  (none)" >&2
+}
 
-    local platform latest current tarball
+# ── cmd: list-remote ──────────────────────────────────────────────────────────
+cmd_list_remote() {
+    local count="${1:-10}"
+    header "Latest ${count} stable Go releases on go.dev"
+    fetch_all_remote_versions | head -"$count" | while read -r v; do
+        echo "  $v"
+    done
+}
 
+# ── cmd: install [version] ────────────────────────────────────────────────────
+cmd_install() {
+    local target_ver="${1:-}"
+    local platform
     platform=$(detect_platform)
     info "Platform: ${platform}"
 
-    info "Fetching latest Go version from go.dev …"
-    latest=$(fetch_latest_version)
-    info "Latest available: ${BOLD}${latest}${RESET}"
+    if [[ -z "$target_ver" ]]; then
+        info "Fetching latest stable version …"
+        target_ver=$(fetch_latest_version)
+    fi
+    # Normalise: accept "1.22.1" or "go1.22.1"
+    [[ "$target_ver" != go* ]] && target_ver="go${target_ver}"
 
-    current=$(current_version)
-    if [[ -n "$current" ]]; then
-        info "Currently installed: ${BOLD}${current}${RESET}"
-        if is_up_to_date "$current" "$latest"; then
-            success "Already up to date (${current}). Nothing to do."
-            ensure_path
-            exit 0
+    info "Target version: ${BOLD}${target_ver}${RESET}"
+
+    local install_path="${VERSIONS_DIR}/${target_ver}"
+    if [[ -d "$install_path" ]]; then
+        warn "${target_ver} is already installed at ${install_path}"
+        read -rp "Re-install? [y/N] " yn
+        [[ ! "${yn,,}" =~ ^y ]] && return 0
+        safe_sudo rm -rf "$install_path"
+    fi
+
+    # Check active vs latest when no version specified
+    if [[ "${ORIGINAL_CMD:-}" == "update" ]]; then
+        local current
+        current=$(active_version)
+        if [[ -n "$current" ]]; then
+            local c_bare l_bare
+            c_bare=$(normalise "$current"); l_bare=$(normalise "$target_ver")
+            if ver_ge "$c_bare" "$l_bare"; then
+                success "Already up to date (${current})."
+                return 0
+            fi
+            info "Upgrade: ${current} → ${target_ver}"
         fi
-        info "Upgrade available: ${current} → ${latest}"
+    fi
+
+    local tarball
+    tarball=$(download_go "$target_ver" "$platform")
+
+    info "Installing ${target_ver} to ${install_path} …"
+    safe_sudo mkdir -p "$VERSIONS_DIR"
+    # Extract into a temp name, then rename to versioned dir
+    local tmp_dir="${VERSIONS_DIR}/_tmp_go_extract"
+    safe_sudo rm -rf "$tmp_dir"
+    safe_sudo tar -C "$VERSIONS_DIR" -xzf "$tarball"
+    safe_sudo mv "${VERSIONS_DIR}/go" "$install_path"
+    rm -f "$tarball"
+
+    success "${target_ver} installed → ${install_path}"
+
+    # Auto-activate if nothing is active or if updating
+    if [[ ! -e "$ACTIVE_LINK" ]] || [[ "${ORIGINAL_CMD:-}" == "update" ]]; then
+        cmd_use "$target_ver"
     else
-        info "Go is not currently installed."
+        info "To activate: $0 use ${target_ver}"
     fi
+}
 
-    # Prompt unless --yes / -y flag given
-    if [[ "${1:-}" != "-y" && "${1:-}" != "--yes" ]]; then
-        read -rp $'\nProceed with installation of '"${latest}"'? [Y/n] ' yn
-        [[ "${yn,,}" =~ ^(n|no)$ ]] && { info "Aborted."; exit 0; }
-    fi
+# ── cmd: use <version> ────────────────────────────────────────────────────────
+cmd_use() {
+    local ver="${1:-}"
+    [[ -z "$ver" ]] && error "Usage: $0 use <version>  (e.g. go1.26.3 or 1.26.3)"
+    [[ "$ver" != go* ]] && ver="go${ver}"
 
-    tarball=$(download_go "$latest" "$platform")
-    install_go "$tarball"
+    local install_path="${VERSIONS_DIR}/${ver}"
+    [[ ! -d "$install_path" ]] && error "${ver} is not installed. Run: $0 install ${ver}"
+
+    info "Switching active version to ${ver} …"
+    safe_sudo ln -sfn "$install_path" "$ACTIVE_LINK"
     ensure_path
+    success "Active Go → ${ver}"
+    "${ACTIVE_LINK}/bin/go" version
+}
 
-    echo ""
-    success "Go ${latest} installed successfully!"
-    echo -e "  ${CYAN}go version:${RESET} $("${GO_INSTALL_DIR}/go/bin/go" version)"
-    echo ""
+# ── cmd: remove <version> ─────────────────────────────────────────────────────
+cmd_remove() {
+    local ver="${1:-}"
+    [[ -z "$ver" ]] && error "Usage: $0 remove <version>"
+    [[ "$ver" != go* ]] && ver="go${ver}"
+
+    local install_path="${VERSIONS_DIR}/${ver}"
+    [[ ! -d "$install_path" ]] && error "${ver} is not installed."
+
+    local active
+    active=$(active_version)
+    if [[ "$active" == "$ver" ]]; then
+        warn "${ver} is currently active."
+        read -rp "Remove anyway? The active symlink will be broken. [y/N] " yn
+        [[ ! "${yn,,}" =~ ^y ]] && return 0
+        safe_sudo rm -f "$ACTIVE_LINK"
+    fi
+
+    read -rp "Remove ${install_path}? [y/N] " yn
+    [[ ! "${yn,,}" =~ ^y ]] && { info "Aborted."; return 0; }
+
+    safe_sudo rm -rf "$install_path"
+    success "${ver} removed."
+
+    # Suggest another version if available
+    local remaining
+    remaining=$(installed_versions | tail -1)
+    if [[ -n "$remaining" ]]; then
+        info "Other installed versions available. Run: $0 use ${remaining}"
+    fi
+}
+
+# ── cmd: update (install latest & activate) ───────────────────────────────────
+cmd_update() {
+    ORIGINAL_CMD="update" cmd_install ""
+}
+
+# =============================================================================
+#  Entry point
+# =============================================================================
+usage() {
+    cat >&2 <<EOF
+
+${BOLD}GoUpdateAutomate — Go Version Manager${RESET}
+
+Usage:
+  $(basename "$0") [command] [options]
+
+Commands:
+  ${CYAN}install [version]${RESET}   Install a specific version (default: latest stable)
+  ${CYAN}update${RESET}              Install latest stable & activate it
+  ${CYAN}use <version>${RESET}       Switch the active Go version
+  ${CYAN}remove <version>${RESET}    Uninstall a specific version
+  ${CYAN}list${RESET}                Show locally installed versions
+  ${CYAN}list-remote [n]${RESET}     Show latest N releases from go.dev  (default: 10)
+  ${CYAN}current${RESET}             Show the active version
+
+Environment:
+  GO_VERSIONS_DIR   Where versions are stored  (default: /usr/local/go-versions)
+  GO_ACTIVE_LINK    Symlink for active version  (default: /usr/local/go)
+  PROFILE_FILE      Shell profile to patch      (default: auto-detect)
+
+Examples:
+  $(basename "$0") install            # install latest
+  $(basename "$0") install 1.22.5     # install specific version
+  $(basename "$0") use 1.22.5
+  $(basename "$0") list-remote 5
+  $(basename "$0") remove 1.21.0
+
+EOF
+}
+
+main() {
+    echo -e "\n${BOLD}══════════════════════════════════════${RESET}" >&2
+    echo -e "${BOLD}   GoUpdateAutomate — Go Version Mgr  ${RESET}" >&2
+    echo -e "${BOLD}══════════════════════════════════════${RESET}" >&2
+
+    local cmd="${1:-update}"
+    shift || true
+
+    case "$cmd" in
+        install)      cmd_install "$@" ;;
+        update)       cmd_update ;;
+        use)          cmd_use "$@" ;;
+        remove|rm)    cmd_remove "$@" ;;
+        list|ls)      cmd_list ;;
+        list-remote)  cmd_list_remote "$@" ;;
+        current)      cmd_current ;;
+        -h|--help|help) usage ;;
+        *) warn "Unknown command: ${cmd}"; usage; exit 1 ;;
+    esac
 }
 
 main "$@"
