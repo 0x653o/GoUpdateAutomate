@@ -146,58 +146,129 @@ profile_for_user() {
     esac
 }
 
-# Append PATH export to a profile file (owned by $owner) if not already present
+# ── sed-based profile editor ──────────────────────────────────────────────────
+# Uses a named marker block so the entry is always clean and idempotent:
+#
+#   # >>> go managed by update_go.sh >>>
+#   export PATH="$PATH:/usr/local/go/bin"
+#   # <<< go managed by update_go.sh <<<
+#
+# • If the block already exists  → sed replaces the PATH line inside it
+# • If no block yet              → appends the whole block
+# • Always written as $owner     → no root-owned lines in user files
+# ─────────────────────────────────────────────────────────────────────────────
+MARKER_BEGIN="# >>> go managed by update_go.sh >>>"
+MARKER_END="# <<< go managed by update_go.sh <<<"
+
 patch_profile() {
     local profile="$1" owner="$2" go_bin="$3"
-    grep -qF "$go_bin" "$profile" 2>/dev/null && return 0
-    info "Patching ${profile} …"
-    local line; line=$'\n'"# Go — added by update_go.sh"$'\n'"export PATH=\"\$PATH:${go_bin}\""
-    # Write as the file owner to avoid root-owned lines in user files
-    if [[ "$EUID" -eq 0 && "$owner" != "root" ]]; then
-        echo "$line" | sudo -u "$owner" tee -a "$profile" >/dev/null
-    else
-        echo "$line" >> "$profile"
+    local export_line="export PATH=\"\$PATH:${go_bin}\""
+
+    # Create file if missing
+    if [[ ! -f "$profile" ]]; then
+        if [[ "$EUID" -eq 0 && "$owner" != "root" ]]; then
+            sudo -u "$owner" touch "$profile"
+        else
+            touch "$profile"
+        fi
     fi
-    success "Patched ${profile}"
+
+    # Helper: run a command as $owner (or directly if we already are $owner)
+    run_as() {
+        if [[ "$EUID" -eq 0 && "$owner" != "root" ]]; then
+            sudo -u "$owner" "$@"
+        else
+            "$@"
+        fi
+    }
+
+    if grep -qF "$MARKER_BEGIN" "$profile" 2>/dev/null; then
+        # Block exists — update the PATH line inside it with sed
+        info "Updating existing Go block in ${profile} …"
+        run_as sed -i \
+            "/${MARKER_BEGIN}/,/${MARKER_END}/s|^export PATH=.*|${export_line}|" \
+            "$profile"
+        success "Updated  ${profile}"
+    else
+        # No block yet — append it
+        info "Adding Go block to ${profile} …"
+        local block
+        block=$(printf '\n%s\n%s\n%s\n' \
+            "$MARKER_BEGIN" "$export_line" "$MARKER_END")
+        if [[ "$EUID" -eq 0 && "$owner" != "root" ]]; then
+            echo "$block" | sudo -u "$owner" tee -a "$profile" >/dev/null
+        else
+            echo "$block" >> "$profile"
+        fi
+        success "Appended ${profile}"
+    fi
+}
+
+# ── /etc/profile.d writer ─────────────────────────────────────────────────────
+patch_profiled() {
+    local go_bin="$1"
+    local sysd="/etc/profile.d/go.sh"
+    local export_line="export PATH=\"\$PATH:${go_bin}\""
+
+    if grep -qF "$MARKER_BEGIN" "$sysd" 2>/dev/null; then
+        info "Updating ${sysd} …"
+        safe_sudo sed -i \
+            "/${MARKER_BEGIN}/,/${MARKER_END}/s|^export PATH=.*|${export_line}|" \
+            "$sysd"
+    else
+        info "Writing ${sysd} …"
+        printf '%s\n%s\n%s\n' "$MARKER_BEGIN" "$export_line" "$MARKER_END" \
+            | safe_sudo tee "$sysd" >/dev/null
+        safe_sudo chmod 644 "$sysd"
+    fi
+    success "System-wide profile: ${sysd}"
+}
+
+# ── auto-source helper ────────────────────────────────────────────────────────
+# Sources a file as the real user so the PATH is live in this terminal session.
+# Works by temporarily dropping privileges when running under sudo.
+autosource() {
+    local profile="$1" real_usr="$2"
+    info "Sourcing ${profile} …"
+    if [[ "$EUID" -eq 0 && "$real_usr" != "root" ]]; then
+        # Export PATH into the user's env by sourcing inside su -c
+        local new_path
+        new_path=$(sudo -u "$real_usr" bash -lc \
+            "source \"$profile\" 2>/dev/null; echo \"\$PATH\"" 2>/dev/null) || true
+        [[ -n "$new_path" ]] && export PATH="$new_path"
+    else
+        # shellcheck source=/dev/null
+        source "$profile" 2>/dev/null || true
+    fi
 }
 
 ensure_path() {
     local go_bin="${ACTIVE_LINK}/bin"
     local real_usr
     real_usr=$(real_user)
-
-    # 1) System-wide: /etc/profile.d/go.sh  (takes effect on next login for ALL users)
-    local sysd="/etc/profile.d/go.sh"
-    if ! grep -qF "$go_bin" "$sysd" 2>/dev/null; then
-        info "Writing system-wide profile: ${sysd}"
-        echo -e "# Go — added by update_go.sh\nexport PATH=\"\$PATH:${go_bin}\"" \
-            | safe_sudo tee "$sysd" >/dev/null
-        safe_sudo chmod 644 "$sysd"
-        success "Written ${sysd}"
-    fi
-
-    # 2) Real invoking user's RC (e.g. /home/g0d/.bashrc)
-    local user_profile
+    local user_profile root_profile
     user_profile=$(profile_for_user "$real_usr")
+
+    # 1) /etc/profile.d/go.sh  — system-wide, all users
+    patch_profiled "$go_bin"
+
+    # 2) Real user's RC  (e.g. /home/g0d/.bashrc)
     patch_profile "$user_profile" "$real_usr" "$go_bin"
 
-    # 3) Root's RC too, if we're actually running as root under sudo
+    # 3) Root's RC as well when running under sudo
     if [[ "$EUID" -eq 0 && "$real_usr" != "root" ]]; then
-        local root_profile
         root_profile=$(profile_for_user "root")
         patch_profile "$root_profile" "root" "$go_bin"
     fi
 
-    # Make go available in this session immediately
-    export PATH="$PATH:${go_bin}"
+    # 4) Auto-source so 'go' works immediately in THIS terminal
+    autosource "$user_profile" "$real_usr"
+    export PATH="$PATH:${go_bin}"   # fallback if source didn't propagate
 
-    echo -e "\n${YELLOW}╔══════════════════════════════════════════════════════╗${RESET}" >&2
-    echo -e "${YELLOW}║  Reload your shell to use 'go' in new terminals:     ║${RESET}" >&2
-    echo -e "${YELLOW}║                                                       ║${RESET}" >&2
-    echo -e "${YELLOW}║    source ${user_profile}$(printf '%*s' $((23 - ${#user_profile})) '')║${RESET}" >&2
-    echo -e "${YELLOW}║                                                       ║${RESET}" >&2
-    echo -e "${YELLOW}║  Or open a new terminal — it will load automatically. ║${RESET}" >&2
-    echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${RESET}" >&2
+    echo "" >&2
+    success "'go' is now available in this terminal!"
+    echo -e "  ${CYAN}Patched:${RESET} ${user_profile}  +  /etc/profile.d/go.sh" >&2
+    echo -e "  ${CYAN}New terminals${RESET} will have 'go' automatically." >&2
 }
 
 # ── Download & verify ─────────────────────────────────────────────────────────

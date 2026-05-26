@@ -40,22 +40,21 @@ chmod +x update_go.sh
 sudo ./update_go.sh install
 ```
 
-After installation the script patches three places automatically:
+After installation the script patches three places automatically using `sed` — keeping a clean, idempotent marker block that is updated (not duplicated) on future runs:
+
+```bash
+# >>> go managed by update_go.sh >>>
+export PATH="$PATH:/usr/local/go/bin"
+# <<< go managed by update_go.sh <<<
+```
 
 | File | Scope |
 |------|-------|
-| `/etc/profile.d/go.sh` | All users — active on next login |
-| `~/.bashrc` (or `~/.zshrc`) of the **invoking user** | Your shell sessions |
-| `/root/.bashrc` | Root sessions (when run via sudo) |
+| `/etc/profile.d/go.sh` | All users — sourced on every login |
+| `~/.bashrc` / `~/.zshrc` of the **invoking user** | Your interactive shell |
+| `/root/.bashrc` | Root sessions (only when run via `sudo`) |
 
-**Reload your current terminal** to pick up the new PATH:
-
-```bash
-source ~/.bashrc   # or ~/.zshrc
-go version
-```
-
-> **Tip:** New terminals will have `go` available automatically without sourcing.
+The script also **auto-sources** the patched RC file so `go` is available immediately in the current terminal — no manual `source` needed.
 
 ---
 
