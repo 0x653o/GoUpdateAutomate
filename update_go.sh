@@ -110,25 +110,94 @@ installed_versions() {
 }
 
 # ── Shell profile ─────────────────────────────────────────────────────────────
-detect_profile() {
-    [[ -n "$PROFILE_FILE" ]] && { echo "$PROFILE_FILE"; return; }
-    case "$(basename "${SHELL:-bash}")" in
-        zsh)  echo "${HOME}/.zshrc"  ;;
-        fish) echo "${HOME}/.config/fish/config.fish" ;;
-        *)    echo "${HOME}/.bashrc" ;;
+
+# Returns the real (non-root) invoking user, even under sudo
+real_user() {
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        echo "$SUDO_USER"
+    else
+        echo "${USER:-$(id -un)}"
+    fi
+}
+
+# Home dir for a given username
+user_home() {
+    local u="$1"
+    getent passwd "$u" 2>/dev/null | cut -d: -f6 || eval echo "~${u}"
+}
+
+# Shell for a given username
+user_shell() {
+    local u="$1"
+    getent passwd "$u" 2>/dev/null | cut -d: -f7 || echo "/bin/bash"
+}
+
+# RC file for a given user
+profile_for_user() {
+    local u="$1"
+    if [[ -n "$PROFILE_FILE" ]]; then echo "$PROFILE_FILE"; return; fi
+    local home shell_name
+    home=$(user_home "$u")
+    shell_name=$(basename "$(user_shell "$u")")
+    case "$shell_name" in
+        zsh)  echo "${home}/.zshrc"  ;;
+        fish) echo "${home}/.config/fish/config.fish" ;;
+        *)    echo "${home}/.bashrc" ;;
     esac
+}
+
+# Append PATH export to a profile file (owned by $owner) if not already present
+patch_profile() {
+    local profile="$1" owner="$2" go_bin="$3"
+    grep -qF "$go_bin" "$profile" 2>/dev/null && return 0
+    info "Patching ${profile} …"
+    local line; line=$'\n'"# Go — added by update_go.sh"$'\n'"export PATH=\"\$PATH:${go_bin}\""
+    # Write as the file owner to avoid root-owned lines in user files
+    if [[ "$EUID" -eq 0 && "$owner" != "root" ]]; then
+        echo "$line" | sudo -u "$owner" tee -a "$profile" >/dev/null
+    else
+        echo "$line" >> "$profile"
+    fi
+    success "Patched ${profile}"
 }
 
 ensure_path() {
     local go_bin="${ACTIVE_LINK}/bin"
-    local profile
-    profile=$(detect_profile)
-    if ! grep -qF "$go_bin" "$profile" 2>/dev/null; then
-        info "Adding ${go_bin} to PATH in ${profile}"
-        { echo ""; echo "# Go — added by update_go.sh"; echo "export PATH=\"\$PATH:${go_bin}\""; } >> "$profile"
-        success "PATH updated — run: source ${profile}"
+    local real_usr
+    real_usr=$(real_user)
+
+    # 1) System-wide: /etc/profile.d/go.sh  (takes effect on next login for ALL users)
+    local sysd="/etc/profile.d/go.sh"
+    if ! grep -qF "$go_bin" "$sysd" 2>/dev/null; then
+        info "Writing system-wide profile: ${sysd}"
+        echo -e "# Go — added by update_go.sh\nexport PATH=\"\$PATH:${go_bin}\"" \
+            | safe_sudo tee "$sysd" >/dev/null
+        safe_sudo chmod 644 "$sysd"
+        success "Written ${sysd}"
     fi
+
+    # 2) Real invoking user's RC (e.g. /home/g0d/.bashrc)
+    local user_profile
+    user_profile=$(profile_for_user "$real_usr")
+    patch_profile "$user_profile" "$real_usr" "$go_bin"
+
+    # 3) Root's RC too, if we're actually running as root under sudo
+    if [[ "$EUID" -eq 0 && "$real_usr" != "root" ]]; then
+        local root_profile
+        root_profile=$(profile_for_user "root")
+        patch_profile "$root_profile" "root" "$go_bin"
+    fi
+
+    # Make go available in this session immediately
     export PATH="$PATH:${go_bin}"
+
+    echo -e "\n${YELLOW}╔══════════════════════════════════════════════════════╗${RESET}" >&2
+    echo -e "${YELLOW}║  Reload your shell to use 'go' in new terminals:     ║${RESET}" >&2
+    echo -e "${YELLOW}║                                                       ║${RESET}" >&2
+    echo -e "${YELLOW}║    source ${user_profile}$(printf '%*s' $((23 - ${#user_profile})) '')║${RESET}" >&2
+    echo -e "${YELLOW}║                                                       ║${RESET}" >&2
+    echo -e "${YELLOW}║  Or open a new terminal — it will load automatically. ║${RESET}" >&2
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${RESET}" >&2
 }
 
 # ── Download & verify ─────────────────────────────────────────────────────────

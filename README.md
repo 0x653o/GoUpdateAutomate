@@ -38,11 +38,24 @@ chmod +x update_go.sh
 
 # Install latest stable Go
 sudo ./update_go.sh install
+```
 
-# Reload PATH
-source ~/.bashrc
+After installation the script patches three places automatically:
+
+| File | Scope |
+|------|-------|
+| `/etc/profile.d/go.sh` | All users — active on next login |
+| `~/.bashrc` (or `~/.zshrc`) of the **invoking user** | Your shell sessions |
+| `/root/.bashrc` | Root sessions (when run via sudo) |
+
+**Reload your current terminal** to pick up the new PATH:
+
+```bash
+source ~/.bashrc   # or ~/.zshrc
 go version
 ```
+
+> **Tip:** New terminals will have `go` available automatically without sourcing.
 
 ---
 
